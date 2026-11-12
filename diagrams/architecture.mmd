@@ -1,0 +1,60 @@
+flowchart TD
+    subgraph DATA["Data layer"]
+        CSV[("data/songs.csv<br/>17 songs")]
+    end
+
+    subgraph CLI["src/main.py: CLI runner"]
+        PROFILES["PROFILES<br/>10 user taste profiles<br/>3 standard + 7 edge cases"]
+        MAIN["main() / run_profile()<br/>loops over every profile"]
+        PRINT["print_recommendations()<br/>ranked report + input warnings"]
+        SKIP["print_skipped_profile()<br/>errors, no recommendations"]
+        SUMMARY["print_evaluation_summary()<br/>one metrics row per profile"]
+    end
+
+    subgraph REL["src/reliability.py: reliability and evaluation layer"]
+        SAFE["load_songs_safely()<br/>validate_song() / validate_catalog()<br/>skips and reports bad rows"]
+        VPREF["validate_user_prefs()<br/>errors: missing key, wrong type, energy outside 0-1<br/>warnings: spaces, casing, empty, not in catalog"]
+        CHECK["check_recommendations() / check_score()<br/>score range, reasons add up, sorted,<br/>no duplicates, true top k"]
+        EVAL["evaluate_recommendations()<br/>Precision@k (relevant = 3 of 4 matches),<br/>match rates, energy gap, score %"]
+    end
+
+    subgraph REC["src/recommender.py: rule-based scoring engine"]
+        LOAD["load_songs()<br/>parses the CSV, casts numeric columns"]
+        RANK["recommend_songs(user_prefs, songs, k=5)<br/>scores every song, sorts descending, keeps top k"]
+        subgraph SCORE["score_song(): max 5.0 points"]
+            direction LR
+            G["Genre match<br/>+1.5"]
+            M["Mood match<br/>+1.0"]
+            E["Energy closeness<br/>0 to +2.0"]
+            A["Acoustic fit<br/>+0.5"]
+        end
+        OOP["Song / UserProfile dataclasses<br/>Recommender class: uses score_song()"]
+    end
+
+    TESTS["tests/<br/>test_recommender.py + test_reliability.py<br/>pytest"]
+    OUT[/"Terminal output<br/>catalog check, reports, evaluation summary"/]
+
+    CSV -->|"file path"| SAFE
+    MAIN -->|"1. load + validate catalog"| SAFE
+    SAFE -->|"valid songs + issues"| MAIN
+    PROFILES -->|"user_prefs dict"| MAIN
+    MAIN -->|"2. validate profile"| VPREF
+    VPREF -->|"errors"| SKIP
+    VPREF -->|"OK or warnings"| MAIN
+    MAIN -->|"3. user_prefs + songs"| RANK
+    RANK -->|"one song at a time"| SCORE
+    SCORE -->|"score + reasons"| RANK
+    RANK -->|"top k: song, score, explanation"| MAIN
+    MAIN -->|"4. results"| PRINT
+    MAIN -->|"5. verify"| CHECK
+    MAIN -->|"6. measure"| EVAL
+    CHECK -.->|"re-scores with"| SCORE
+    EVAL -.->|"reads reasons from"| SCORE
+    OOP -.->|"reuses"| SCORE
+    CHECK -->|"PASS / FAIL"| SUMMARY
+    EVAL -->|"metrics"| SUMMARY
+    PRINT --> OUT
+    SKIP --> OUT
+    SUMMARY --> OUT
+    TESTS -.->|"tests"| OOP
+    TESTS -.->|"tests"| REL

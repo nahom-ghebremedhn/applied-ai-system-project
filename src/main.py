@@ -9,16 +9,77 @@ You will implement the functions in recommender.py:
 - recommend_songs
 """
 
-from recommender import load_songs, recommend_songs
+import sys
+import textwrap
+from pathlib import Path
+
+# Supports both run commands:
+#   python -m src.main  -> "src" is a package, so use relative imports
+#   python src/main.py  -> src/ is on the path, so import the modules directly
+try:
+    from .recommender import MAX_SCORE, recommend_songs
+    from .reliability import (
+        ERROR, RELEVANCE_THRESHOLD, WARNING, check_recommendations, count_level, evaluate_recommendations,
+        has_errors, load_songs_safely, validate_user_prefs,
+    )
+except ImportError:
+    from recommender import MAX_SCORE, recommend_songs
+    from reliability import (
+        ERROR, RELEVANCE_THRESHOLD, WARNING, check_recommendations, count_level, evaluate_recommendations,
+        has_errors, load_songs_safely, validate_user_prefs,
+    )
+
+# Found relative to this file, so the app works from any folder.
+DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "songs.csv"
+K = 5
 
 
-def main() -> None:
-    songs = load_songs("data/songs.csv")
+def main() -> int:
+    """Runs every profile, then prints the evaluation summary. Returns the exit code."""
+    try:
+        songs, catalog_issues = load_songs_safely(str(DATA_PATH))
+    except FileNotFoundError:
+        print(f"ERROR: could not find the song catalog at {DATA_PATH}")
+        return 1
+
     print(f"Loaded songs: {len(songs)}")
+    print_catalog_check(songs, catalog_issues)
+    if not songs:
+        print("ERROR: no valid songs to recommend from. Fix the catalog and try again.")
+        return 1
 
-    for name, user_prefs in PROFILES.items():
-        recommendations = recommend_songs(user_prefs, songs, k=5)
-        print_recommendations(name, user_prefs, recommendations)
+    rows = [run_profile(name, user_prefs, songs) for name, user_prefs in PROFILES.items()]
+    print_evaluation_summary(rows)
+
+    # A failed check means a bug in the scoring or ranking code, not bad input.
+    return 1 if any(row["checks"] == "FAIL" for row in rows) else 0
+
+
+def run_profile(name: str, user_prefs: dict, songs: list) -> dict:
+    """Validates, recommends, verifies and evaluates one profile. Returns its summary row."""
+    input_issues = validate_user_prefs(user_prefs, songs)
+    row = {"name": name, "input": "OK", "checks": "-", "metrics": None}
+
+    if has_errors(input_issues):
+        # Don't show recommendations that would be misleading.
+        print_skipped_profile(name, user_prefs, input_issues)
+        row["input"] = "ERROR"
+        return row
+
+    warning_count = count_level(input_issues, WARNING)
+    if warning_count:
+        row["input"] = f"WARN({warning_count})"
+
+    recommendations = recommend_songs(user_prefs, songs, k=K)
+    print_recommendations(name, user_prefs, recommendations, input_issues)
+
+    check_issues = check_recommendations(user_prefs, songs, recommendations, K)
+    row["checks"] = "FAIL" if check_issues else "PASS"
+    for issue in check_issues:
+        print(f" CHECK FAILED: {issue.message}")
+
+    row["metrics"] = evaluate_recommendations(user_prefs, recommendations, songs)
+    return row
 
 
 # Distinct taste profiles used to test the recommender
@@ -97,11 +158,38 @@ PROFILES = {
 }
 
 
-MAX_SCORE = 5.0
 WIDTH = 60
 
 
-def print_recommendations(name: str, user_prefs: dict, recommendations: list) -> None:
+def print_issue_list(issues: list, indent: str = "   ") -> None:
+    """Prints issues wrapped to the report width, e.g. "   ! WARNING: ..." """
+    for issue in issues:
+        print(textwrap.fill(
+            str(issue), width=WIDTH, initial_indent=f"{indent}! ", subsequent_indent=f"{indent}  "
+        ))
+
+
+def print_catalog_check(songs: list, issues: list) -> None:
+    """Reports the result of validating songs.csv."""
+    errors = count_level(issues, ERROR)
+    warnings = count_level(issues, WARNING)
+    print(f"Catalog check: {len(songs)} valid songs, {errors} errors, {warnings} warnings")
+    print_issue_list(issues)
+
+
+def print_skipped_profile(name: str, user_prefs: dict, issues: list) -> None:
+    """Explains why a profile got no recommendations."""
+    print()
+    print("=" * WIDTH)
+    print(f" TOP RECOMMENDATIONS: {name}".center(WIDTH))
+    print("=" * WIDTH)
+    print(f" Profile: {user_prefs}")
+    print(" NO RECOMMENDATIONS: the profile has invalid input.")
+    print_issue_list(issues)
+    print("-" * WIDTH)
+
+
+def print_recommendations(name: str, user_prefs: dict, recommendations: list, issues: list = ()) -> None:
     """Prints the ranked recommendations as a readable terminal report."""
     acoustic = "acoustic" if user_prefs["likes_acoustic"] else "produced"
     print()
@@ -112,6 +200,9 @@ def print_recommendations(name: str, user_prefs: dict, recommendations: list) ->
         f" Profile: {user_prefs['favorite_genre']} | {user_prefs['favorite_mood']} | "
         f"energy {user_prefs['target_energy']:.2f} | {acoustic}"
     )
+    if issues:
+        print(" Input warnings:")
+        print_issue_list(issues)
     print("-" * WIDTH)
 
     for rank, (song, score, explanation) in enumerate(recommendations, start=1):
@@ -123,5 +214,42 @@ def print_recommendations(name: str, user_prefs: dict, recommendations: list) ->
         print("-" * WIDTH)
 
 
+def _fmt(value, pattern: str) -> str:
+    """Formats a metric, or shows "-" when it doesn't exist (skipped profile)."""
+    return "-" if value is None else format(value, pattern)
+
+
+def print_evaluation_summary(rows: list) -> None:
+    """Prints one compact line of metrics per profile, plus a short legend."""
+    columns = f"{'Profile':<24}{'Input':<9}{'P@' + str(K):>5}{'Best':>6}{'Genre':>6}{'Mood':>6}{'Enrg':>6}{'Acou':>6}{'Gap':>6}{'Score':>7}  Checks"
+    print()
+    print("=" * len(columns))
+    print(" EVALUATION SUMMARY".center(len(columns)))
+    print("=" * len(columns))
+    print(columns)
+    print("-" * len(columns))
+    for row in rows:
+        m = row["metrics"] or {}
+        print(
+            f"{row['name']:<24}{row['input']:<9}"
+            f"{_fmt(m.get('precision_at_k'), '.2f'):>5}"
+            f"{_fmt(m.get('best_possible_precision'), '.2f'):>6}"
+            f"{_fmt(m.get('genre_match_rate'), '.2f'):>6}"
+            f"{_fmt(m.get('mood_match_rate'), '.2f'):>6}"
+            f"{_fmt(m.get('energy_match_rate'), '.2f'):>6}"
+            f"{_fmt(m.get('acoustic_fit_rate'), '.2f'):>6}"
+            f"{_fmt(m.get('avg_energy_gap'), '.2f'):>6}"
+            f"{_fmt(m.get('avg_score_pct'), '.0f') + ('%' if m else ''):>7}"
+            f"  {row['checks']}"
+        )
+    print("-" * len(columns))
+    print(f" P@{K}: share of the top {K} matching at least {RELEVANCE_THRESHOLD} of the 4 preferences")
+    print("       (genre, mood, energy within 0.2, acoustic fit).")
+    print(f" Best: highest P@{K} this catalog allows. Genre/Mood/Enrg/Acou: match rates.")
+    print(" Gap: average |energy - target|. Score: average score as % of the max.")
+    print(" Input: OK, WARN(n) warnings, or ERROR (profile skipped).")
+    print(" Checks: PASS if scores, explanations and ranking were verified.")
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

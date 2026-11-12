@@ -1,6 +1,9 @@
 import csv
 from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+
+# Highest score score_song() can give: genre 1.5 + mood 1.0 + energy 2.0 + acoustic 0.5
+MAX_SCORE = 5.0
 
 @dataclass
 class Song:
@@ -39,12 +42,21 @@ class Recommender:
         self.songs = songs
 
     def recommend(self, user: UserProfile, k: int = 5) -> List[Song]:
-        # TODO: Implement recommendation logic
-        return self.songs[:k]
+        """Returns the top k Song objects, ranked by the same score_song() rules the CLI uses."""
+        # asdict() turns the dataclasses into the plain dicts score_song() expects.
+        # The UserProfile field names match the user_prefs keys exactly.
+        user_prefs = asdict(user)
+        ranked = sorted(
+            self.songs,
+            key=lambda song: score_song(user_prefs, asdict(song))[0],
+            reverse=True,
+        )
+        return ranked[:k]
 
     def explain_recommendation(self, user: UserProfile, song: Song) -> str:
-        # TODO: Implement explanation logic
-        return "Explanation placeholder"
+        """Explains a song's score using the reasons produced by score_song()."""
+        score, reasons = score_song(asdict(user), asdict(song))
+        return f"Score {score:.2f} / {MAX_SCORE:.2f}: " + ", ".join(reasons)
 
 def load_songs(csv_path: str) -> List[Dict]:
     """Reads the songs CSV into a list of dicts, converting numeric columns to int/float."""
